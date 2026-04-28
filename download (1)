@@ -1,0 +1,193 @@
+/**
+ * 入金明細 API
+ *  GET    /api/payments          一覧（フィルタ・検索）
+ *  GET    /api/payments/:id      詳細
+ *  POST   /api/payments          新規登録
+ *  PUT    /api/payments/:id      更新
+ *  DELETE /api/payments/:id      削除
+ *  GET    /api/payments/stats/summary  集計
+ */
+const express = require('express');
+const db = require('../db/connection');
+const router = express.Router();
+
+const VALID_ROUTES = ['biz_form', 'counter_qr', 'shinou', 'telegram'];
+
+// ---------- 一覧 ----------
+router.get('/', (req, res) => {
+  const { q, route, dispatch, matched, from, to, source, limit = 500, offset = 0 } = req.query;
+  const conds = [];
+  const params = {};
+
+  if (q) {
+    conds.push(`(name_kana LIKE @q OR name_kanji LIKE @q OR commercial LIKE @q OR CAST(amount AS TEXT) LIKE @q)`);
+    params.q = `%${q}%`;
+  }
+  if (route) {
+    conds.push('route = @route');
+    params.route = route;
+  }
+  if (dispatch) {
+    conds.push('dispatch_type = @dispatch');
+    params.dispatch = dispatch;
+  }
+  if (matched === 'matched') conds.push('matched = 1');
+  if (matched === 'unmatched') conds.push('matched = 0');
+  if (from) { conds.push('payment_date >= @from'); params.from = from; }
+  if (to) { conds.push('payment_date <= @to'); params.to = to; }
+  if (source) { conds.push('source = @source'); params.source = source; }
+
+  const where = conds.length ? 'WHERE ' + conds.join(' AND ') : '';
+  const sql = `
+    SELECT * FROM payments
+    ${where}
+    ORDER BY payment_date DESC, id DESC
+    LIMIT @limit OFFSET @offset
+  `;
+  params.limit = Number(limit);
+  params.offset = Number(offset);
+
+  const rows = db.prepare(sql).all(params);
+  const total = db.prepare(`SELECT COUNT(*) AS c FROM payments ${where}`).get(params).c;
+
+  res.json({ data: rows, total, limit: params.limit, offset: params.offset });
+});
+
+// ---------- 統計 ----------
+router.get('/stats/summary', (req, res) => {
+  const { from, to } = req.query;
+  const conds = [];
+  const params = {};
+  if (from) { conds.push('payment_date >= @from'); params.from = from; }
+  if (to) { conds.push('payment_date <= @to'); params.to = to; }
+  const where = conds.length ? 'WHERE ' + conds.join(' AND ') : '';
+
+  const total = db.prepare(`SELECT COUNT(*) AS count, COALESCE(SUM(amount),0) AS amount FROM payments ${where}`).get(params);
+  const matched = db.prepare(`SELECT COUNT(*) AS count, COALESCE(SUM(amount),0) AS amount FROM payments ${where} ${where ? 'AND' : 'WHERE'} matched = 1`).get(params);
+  const unmatched = db.prepare(`SELECT COUNT(*) AS count, COALESCE(SUM(amount),0) AS amount FROM payments ${where} ${where ? 'AND' : 'WHERE'} matched = 0`).get(params);
+
+  const byRoute = db.prepare(`
+    SELECT route, COUNT(*) AS count, COALESCE(SUM(amount),0) AS amount
+    FROM payments ${where}
+    GROUP BY route
+  `).all(params);
+
+  const byDispatch = db.prepare(`
+    SELECT route, dispatch_type, COUNT(*) AS count, COALESCE(SUM(amount),0) AS amount
+    FROM payments ${where}
+    GROUP BY route, dispatch_type
+  `).all(params);
+
+  const byDate = db.prepare(`
+    SELECT payment_date, COUNT(*) AS count, COALESCE(SUM(amount),0) AS amount
+    FROM payments ${where}
+    GROUP BY payment_date
+    ORDER BY payment_date DESC
+    LIMIT 30
+  `).all(params);
+
+  res.json({ total, matched, unmatched, byRoute, byDispatch, byDate });
+});
+
+// ---------- 詳細 ----------
+router.get('/:id', (req, res) => {
+  const row = db.prepare('SELECT * FROM payments WHERE id = ?').get(req.params.id);
+  if (!row) return res.status(404).json({ error: 'not found' });
+  res.json(row);
+});
+
+// ---------- 新規 ----------
+router.post('/', (req, res) => {
+  const b = req.body || {};
+  if (!b.payment_date || !b.name_kana || !b.amount) {
+    return res.status(400).json({ error: '必須項目不足: payment_date, name_kana, amount' });
+  }
+  if (b.route && !VALID_ROUTES.includes(b.route)) {
+    return res.status(400).json({ error: '不正な経路: ' + b.route });
+  }
+
+  const result = db.prepare(`
+    INSERT INTO payments (
+      payment_date, name_kana, name_kanji, amount, route,
+      dispatch_type, account_no, commercial, matched, pdf_filename, note, source
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `).run(
+    b.payment_date, b.name_kana, b.name_kanji || '', Number(b.amount), b.route || 'biz_form',
+    b.dispatch_type || '', b.account_no || '', b.commercial || '',
+    b.matched ? 1 : 0, b.pdf_filename || '', b.note || '', b.source || 'manual'
+  );
+  const created = db.prepare('SELECT * FROM payments WHERE id = ?').get(result.lastInsertRowid);
+  res.status(201).json(created);
+});
+
+// ---------- 更新 ----------
+router.put('/:id', (req, res) => {
+  const id = req.params.id;
+  const exists = db.prepare('SELECT id FROM payments WHERE id = ?').get(id);
+  if (!exists) return res.status(404).json({ error: 'not found' });
+
+  const b = req.body || {};
+  const fields = [];
+  const params = { id };
+  const set = (col, key) => {
+    if (b[key] !== undefined) {
+      fields.push(`${col} = @${key}`);
+      params[key] = b[key];
+    }
+  };
+  set('payment_date', 'payment_date');
+  set('name_kana', 'name_kana');
+  set('name_kanji', 'name_kanji');
+  if (b.amount !== undefined) { fields.push('amount = @amount'); params.amount = Number(b.amount); }
+  set('route', 'route');
+  set('dispatch_type', 'dispatch_type');
+  set('account_no', 'account_no');
+  set('commercial', 'commercial');
+  if (b.matched !== undefined) { fields.push('matched = @matched'); params.matched = b.matched ? 1 : 0; }
+  set('pdf_filename', 'pdf_filename');
+  if (b.pdf_file_id !== undefined) { fields.push('pdf_file_id = @pdf_file_id'); params.pdf_file_id = b.pdf_file_id; }
+  set('note', 'note');
+
+  if (!fields.length) return res.status(400).json({ error: '更新項目なし' });
+
+  db.prepare(`UPDATE payments SET ${fields.join(', ')} WHERE id = @id`).run(params);
+  const updated = db.prepare('SELECT * FROM payments WHERE id = ?').get(id);
+  res.json(updated);
+});
+
+// ---------- 削除 ----------
+router.delete('/:id', (req, res) => {
+  const r = db.prepare('DELETE FROM payments WHERE id = ?').run(req.params.id);
+  if (!r.changes) return res.status(404).json({ error: 'not found' });
+  res.json({ deleted: true, id: Number(req.params.id) });
+});
+
+// ---------- 一括突合更新 ----------
+router.post('/match/auto', (req, res) => {
+  // 氏名カナの先頭部分でPDFと自動マッチング
+  const unmatched = db.prepare(`SELECT * FROM payments WHERE matched = 0`).all();
+  const pdfs = db.prepare(`SELECT * FROM pdf_files WHERE linked = 0`).all();
+
+  let matched = 0;
+  const updateP = db.prepare(`UPDATE payments SET matched = 1, pdf_file_id = ?, pdf_filename = ? WHERE id = ?`);
+  const updatePdf = db.prepare(`UPDATE pdf_files SET linked = 1 WHERE id = ?`);
+
+  const tx = db.transaction(() => {
+    for (const p of unmatched) {
+      const root = (p.name_kanji || p.name_kana).split(/\s/)[0];
+      if (!root) continue;
+      const cand = pdfs.find(f => !f._used && f.filename.includes(root));
+      if (cand) {
+        updateP.run(cand.id, cand.filename, p.id);
+        updatePdf.run(cand.id);
+        cand._used = true;
+        matched++;
+      }
+    }
+  });
+  tx();
+
+  res.json({ matched });
+});
+
+module.exports = router;

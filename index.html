@@ -1,0 +1,91 @@
+/**
+ * DB初期化スクリプト
+ */
+const { DatabaseSync } = require('node:sqlite');
+const path = require('path');
+const fs = require('fs');
+
+const DB_PATH = path.join(__dirname, 'payment.db');
+
+if (process.argv.includes('--clean') && fs.existsSync(DB_PATH)) {
+  fs.unlinkSync(DB_PATH);
+  console.log('既存DBを削除しました');
+}
+
+const db = new DatabaseSync(DB_PATH);
+db.exec('PRAGMA journal_mode = WAL');
+db.exec('PRAGMA foreign_keys = ON');
+
+db.exec(`
+CREATE TABLE IF NOT EXISTS payments (
+  id              INTEGER PRIMARY KEY AUTOINCREMENT,
+  payment_date    TEXT    NOT NULL,
+  name_kana       TEXT    NOT NULL,
+  name_kanji      TEXT,
+  amount          INTEGER NOT NULL,
+  route           TEXT    NOT NULL
+                  CHECK(route IN ('biz_form','counter_qr','shinou','telegram')),
+  dispatch_type   TEXT,
+  account_no      TEXT,
+  commercial      TEXT,
+  matched         INTEGER DEFAULT 0,
+  pdf_file_id     INTEGER,
+  pdf_filename    TEXT,
+  note            TEXT,
+  source          TEXT DEFAULT 'manual',
+  import_log_id   INTEGER,
+  created_at      TEXT DEFAULT (datetime('now','localtime')),
+  updated_at      TEXT DEFAULT (datetime('now','localtime'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_payments_date ON payments(payment_date);
+CREATE INDEX IF NOT EXISTS idx_payments_kana ON payments(name_kana);
+CREATE INDEX IF NOT EXISTS idx_payments_route ON payments(route);
+CREATE INDEX IF NOT EXISTS idx_payments_matched ON payments(matched);
+`);
+
+db.exec(`
+CREATE TABLE IF NOT EXISTS pdf_files (
+  id              INTEGER PRIMARY KEY AUTOINCREMENT,
+  filename        TEXT    NOT NULL,
+  stored_path     TEXT    NOT NULL,
+  original_name   TEXT,
+  page_no         INTEGER,
+  total_pages     INTEGER,
+  size_bytes      INTEGER,
+  linked          INTEGER DEFAULT 0,
+  created_at      TEXT DEFAULT (datetime('now','localtime'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_pdf_linked ON pdf_files(linked);
+`);
+
+db.exec(`
+CREATE TABLE IF NOT EXISTS import_logs (
+  id              INTEGER PRIMARY KEY AUTOINCREMENT,
+  filename        TEXT    NOT NULL,
+  row_count       INTEGER,
+  success_count   INTEGER,
+  error_count     INTEGER,
+  encoding        TEXT,
+  default_route   TEXT,
+  default_dispatch TEXT,
+  note            TEXT,
+  created_at      TEXT DEFAULT (datetime('now','localtime'))
+);
+`);
+
+db.exec(`
+CREATE TRIGGER IF NOT EXISTS payments_updated_at
+AFTER UPDATE ON payments FOR EACH ROW
+BEGIN
+  UPDATE payments SET updated_at = datetime('now','localtime') WHERE id = NEW.id;
+END;
+`);
+
+console.log('✓ DB初期化完了:', DB_PATH);
+console.log('  - payments テーブル');
+console.log('  - pdf_files テーブル');
+console.log('  - import_logs テーブル');
+
+db.close();

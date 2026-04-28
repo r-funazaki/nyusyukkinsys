@@ -1,0 +1,244 @@
+/**
+ * CSV取込・出力 API
+ *  POST /api/csv/import       CSVファイル取込
+ *  POST /api/csv/preview      取込前プレビュー
+ *  GET  /api/csv/export       CSV_all出力
+ *  GET  /api/csv/sample       サンプルCSVダウンロード
+ *  GET  /api/csv/imports      取込履歴
+ */
+const express = require('express');
+const multer = require('multer');
+const path = require('path');
+const fs = require('fs');
+const { parse } = require('csv-parse/sync');
+const { stringify } = require('csv-stringify/sync');
+const iconv = require('iconv-lite');
+const db = require('../db/connection');
+
+const router = express.Router();
+
+// ===== Multer 設定 =====
+const csvDir = path.join(__dirname, '..', 'uploads', 'csv');
+fs.mkdirSync(csvDir, { recursive: true });
+const upload = multer({
+  storage: multer.diskStorage({
+    destination: csvDir,
+    filename: (req, file, cb) => {
+      const ts = new Date().toISOString().replace(/[:.]/g, '-');
+      cb(null, `${ts}_${file.originalname}`);
+    }
+  }),
+  limits: { fileSize: 50 * 1024 * 1024 }
+});
+
+const VALID_ROUTES = ['biz_form', 'counter_qr', 'shinou', 'telegram'];
+const ROUTE_LABELS = {
+  biz_form: '郵貯ビズ振込', counter_qr: '窓口QR支払',
+  shinou: '1090志納', telegram: '電信扱い'
+};
+
+// ----- ファイル → 文字列(エンコーディング自動判定) -----
+function readCsvText(filePath) {
+  const buf = fs.readFileSync(filePath);
+  // BOM付UTF-8
+  if (buf.length >= 3 && buf[0] === 0xEF && buf[1] === 0xBB && buf[2] === 0xBF) {
+    return { text: buf.slice(3).toString('utf-8'), encoding: 'utf-8-bom' };
+  }
+  // UTF-8として有効か簡易判定
+  const utf8 = buf.toString('utf-8');
+  if (!/\uFFFD/.test(utf8)) return { text: utf8, encoding: 'utf-8' };
+  // Shift_JIS フォールバック
+  return { text: iconv.decode(buf, 'Shift_JIS'), encoding: 'shift_jis' };
+}
+
+// ----- 列名のゆるい解決 -----
+function resolveField(row, ...candidates) {
+  const keys = Object.keys(row);
+  for (const c of candidates) {
+    const found = keys.find(k => k.replace(/\s/g, '').toLowerCase().includes(c.toLowerCase()));
+    if (found && row[found] != null && row[found] !== '') return row[found];
+  }
+  return '';
+}
+
+function rowToPayment(row, defaults) {
+  const amountRaw = resolveField(row, '金額', 'amount');
+  const amount = parseInt(String(amountRaw).replace(/[^\d-]/g, ''), 10) || 0;
+  return {
+    payment_date: resolveField(row, '取扱日', '日付', 'date') || defaults.date,
+    name_kana: resolveField(row, '氏名カナ', 'カナ', 'kana', 'name'),
+    name_kanji: resolveField(row, '氏名漢字', '漢字'),
+    amount,
+    route: defaults.route,
+    dispatch_type: resolveField(row, '発送種別', 'dispatch') || defaults.dispatch,
+    account_no: resolveField(row, '口座番号', 'account'),
+    commercial: resolveField(row, 'コマーシャル', '備考', 'commercial'),
+    matched: 0,
+    note: 'CSV取込',
+    source: 'csv'
+  };
+}
+
+// ===== プレビュー =====
+router.post('/preview', upload.single('file'), (req, res) => {
+  if (!req.file) return res.status(400).json({ error: 'ファイル未指定' });
+  try {
+    const { text, encoding } = readCsvText(req.file.path);
+    const rows = parse(text, { columns: true, skip_empty_lines: true, trim: true });
+    res.json({
+      filename: req.file.originalname,
+      stored_path: req.file.path,
+      encoding,
+      headers: rows.length ? Object.keys(rows[0]) : [],
+      row_count: rows.length,
+      preview: rows.slice(0, 50)
+    });
+  } catch (e) {
+    res.status(400).json({ error: 'CSVパース失敗: ' + e.message });
+  }
+});
+
+// ===== 取込確定 =====
+router.post('/import', upload.single('file'), (req, res) => {
+  if (!req.file) return res.status(400).json({ error: 'ファイル未指定' });
+  const defaults = {
+    route: req.body.default_route || 'biz_form',
+    dispatch: req.body.default_dispatch || '一般',
+    date: req.body.default_date || new Date().toISOString().slice(0, 10)
+  };
+  if (!VALID_ROUTES.includes(defaults.route)) {
+    return res.status(400).json({ error: '不正な経路指定' });
+  }
+
+  try {
+    const { text, encoding } = readCsvText(req.file.path);
+    const rows = parse(text, { columns: true, skip_empty_lines: true, trim: true });
+
+    let success = 0, error = 0;
+    const errors = [];
+
+    const logResult = db.prepare(`
+      INSERT INTO import_logs (filename, row_count, success_count, error_count, encoding, default_route, default_dispatch)
+      VALUES (?, ?, ?, ?, ?, ?, ?)
+    `).run(req.file.originalname, rows.length, 0, 0, encoding, defaults.route, defaults.dispatch);
+    const logId = logResult.lastInsertRowid;
+
+    const insert = db.prepare(`
+      INSERT INTO payments (
+        payment_date, name_kana, name_kanji, amount, route,
+        dispatch_type, account_no, commercial, matched, note, source, import_log_id
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `);
+
+    const tx = db.transaction((rows) => {
+      rows.forEach((row, i) => {
+        try {
+          const p = rowToPayment(row, defaults);
+          if (!p.name_kana || !p.amount) {
+            error++;
+            errors.push({ row: i + 1, reason: '氏名カナまたは金額が不正' });
+            return;
+          }
+          insert.run(
+            p.payment_date, p.name_kana, p.name_kanji, p.amount, p.route,
+            p.dispatch_type, p.account_no, p.commercial, p.matched, p.note, p.source, logId
+          );
+          success++;
+        } catch (e) {
+          error++;
+          errors.push({ row: i + 1, reason: e.message });
+        }
+      });
+    });
+    tx(rows);
+
+    db.prepare('UPDATE import_logs SET success_count = ?, error_count = ? WHERE id = ?').run(success, error, logId);
+
+    res.json({
+      log_id: logId,
+      filename: req.file.originalname,
+      encoding,
+      total: rows.length,
+      success,
+      error,
+      errors: errors.slice(0, 20)
+    });
+  } catch (e) {
+    res.status(400).json({ error: 'CSV取込失敗: ' + e.message });
+  }
+});
+
+// ===== CSV_all 出力 =====
+router.get('/export', (req, res) => {
+  const { from, to, route, matched, columns } = req.query;
+  const conds = [];
+  const params = {};
+  if (from) { conds.push('payment_date >= @from'); params.from = from; }
+  if (to) { conds.push('payment_date <= @to'); params.to = to; }
+  if (route) { conds.push('route = @route'); params.route = route; }
+  if (matched === 'matched') conds.push('matched = 1');
+  if (matched === 'unmatched') conds.push('matched = 0');
+  const where = conds.length ? 'WHERE ' + conds.join(' AND ') : '';
+
+  const rows = db.prepare(`SELECT * FROM payments ${where} ORDER BY payment_date, id`).all(params);
+
+  const allCols = {
+    id: 'ID',
+    payment_date: '取扱日',
+    name_kana: '氏名カナ',
+    name_kanji: '氏名漢字',
+    amount: '金額',
+    route: '経路',
+    dispatch_type: '発送種別',
+    account_no: '口座番号',
+    commercial: 'コマーシャル',
+    matched: '突合状態',
+    pdf_filename: 'PDFファイル名',
+    note: 'メモ',
+    source: '取込元',
+    created_at: '登録日時'
+  };
+  const selectedKeys = columns
+    ? columns.split(',').filter(k => allCols[k])
+    : Object.keys(allCols);
+
+  const header = selectedKeys.map(k => allCols[k]);
+  const data = rows.map(r => selectedKeys.map(k => {
+    if (k === 'route') return ROUTE_LABELS[r.route] || r.route;
+    if (k === 'matched') return r.matched ? '突合済' : '未突合';
+    return r[k] ?? '';
+  }));
+
+  const csv = stringify([header, ...data], { quoted_empty: false });
+  const filename = `csv_all_${new Date().toISOString().slice(0, 10)}.csv`;
+
+  res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+  res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+  // BOM付きで出力（Excel互換）
+  res.send('\ufeff' + csv);
+});
+
+// ===== サンプルCSV =====
+router.get('/sample', (req, res) => {
+  const today = new Date().toISOString().slice(0, 10);
+  const rows = [
+    ['取扱日', '氏名カナ', '氏名漢字', '金額', '口座番号', 'コマーシャル', '発送種別'],
+    [today, 'ヤマダ タロウ', '山田 太郎', '15000', '00120-1-234567', '会員番号:A1024', '一般'],
+    [today, 'サトウ ハナコ', '佐藤 花子', '8000', '00120-1-234567', '会員番号:A2048', '速達'],
+    [today, 'タナカ ジロウ', '田中 次郎', '25000', '00120-1-234567', '会員番号:A1099', '書留']
+  ];
+  const csv = stringify(rows);
+  res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+  res.setHeader('Content-Disposition', 'attachment; filename="sample_yucho.csv"');
+  res.send('\ufeff' + csv);
+});
+
+// ===== 取込履歴 =====
+router.get('/imports', (req, res) => {
+  const rows = db.prepare(`
+    SELECT * FROM import_logs ORDER BY created_at DESC LIMIT 100
+  `).all();
+  res.json({ data: rows });
+});
+
+module.exports = router;
